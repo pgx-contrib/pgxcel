@@ -51,6 +51,11 @@ where, args, err := pgxcel.Transpile(ast, pgxcel.WithColumns(columns))
   error. When omitted, every ident in the AST errors. **Never feed
   user input as a column name**; the value of each map entry is
   emitted into the SQL after only identifier quoting.
+- `pgxcel.WithFunctions(map[string]string)` — alias → canonical
+  function-name map applied before dispatch. Use it to feed in ASTs
+  produced by parsers other than cel-go (for example einride/aip-go
+  emits `"="` / `"AND"` / `"NOT"` instead of the cel-go operator
+  names). Unknown aliases pass through unchanged.
 - `pgxcel.WithParamOffset(int)` — the first placeholder number.
   Defaults to `1`. Use a higher value when splicing the fragment into
   a query that already has bound values.
@@ -65,17 +70,13 @@ A nil ast returns `("", nil, nil)`. An unchecked ast
 | `==`, `!=`, `<`, `<=`, `>`, `>=`     | `col op $N` (or `col op col`)           |
 | `&&`, `\|\|`                         | `(lhs AND rhs)` / `(lhs OR rhs)`        |
 | `!`                                  | `(NOT expr)`                            |
+| `s.contains(x)`                      | `s LIKE '%' \|\| $N \|\| '%'`           |
+| `s.startsWith(x)`                    | `s LIKE $N \|\| '%'`                    |
+| `s.endsWith(x)`                      | `s LIKE '%' \|\| $N`                    |
+| `s.matches(re)`                      | `s ~ $N` (POSIX regex)                  |
 | `timestamp("2025-01-02T03:04:05Z")`  | `$N` bound as `time.Time`               |
 | `duration("1h30m")`                  | `$N` bound as `time.Duration`           |
 | unary `-<literal>`                   | bound as signed numeric literal         |
-
-For ASTs originating from an einride/aip parser, the AIP-160-only
-operators are also supported:
-
-| AIP-160                              | Postgres fragment                       |
-| ------------------------------------ | --------------------------------------- |
-| `name:"ali"` (has)                   | `"name" ILIKE '%' \|\| $N \|\| '%'`     |
-| whitespace AND (`FUZZY`)             | same as `&&`                            |
 
 ## Development
 
