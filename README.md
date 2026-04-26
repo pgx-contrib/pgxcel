@@ -70,6 +70,7 @@ A nil ast returns `("", nil, nil)`. An unchecked ast
 | `==`, `!=`, `<`, `<=`, `>`, `>=`     | `col op $N` (or `col op col`)           |
 | `&&`, `\|\|`                         | `(lhs AND rhs)` / `(lhs OR rhs)`        |
 | `!`                                  | `(NOT expr)`                            |
+| `x in [a, b, c]`                     | `x IN ($1, $2, $3)` (empty → `FALSE`)   |
 | `s.contains(x)`                      | `s LIKE '%' \|\| $N \|\| '%'`           |
 | `s.startsWith(x)`                    | `s LIKE $N \|\| '%'`                    |
 | `s.endsWith(x)`                      | `s LIKE '%' \|\| $N`                    |

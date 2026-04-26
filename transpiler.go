@@ -187,6 +187,9 @@ func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
 	case operators.LogicalOr:
 		return t.transpileBinary(call, "OR")
 
+	case operators.In:
+		return t.transpileIn(call)
+
 	case operators.LogicalNot:
 		if len(call.Args) != 1 {
 			return "", fmt.Errorf("NOT expects 1 argument, got %d", len(call.Args))
@@ -255,6 +258,37 @@ func (t *transpiler) transpileBinary(call *exprpb.Expr_Call, op string) (string,
 		return "", err
 	}
 	return "(" + lhs + " " + op + " " + rhs + ")", nil
+}
+
+// transpileIn renders `x in [a, b, c]` as `x IN ($1, $2, $3)`. The
+// right-hand side must be a list literal; an empty list yields `FALSE`
+// since `x IN ()` is not valid SQL. Each element is recursively
+// transpiled, so list members may be constants or column references.
+func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
+	if len(call.Args) != 2 {
+		return "", fmt.Errorf("in expects 2 arguments, got %d", len(call.Args))
+	}
+	lhs, err := t.transpile(call.Args[0])
+	if err != nil {
+		return "", err
+	}
+	list, ok := call.Args[1].ExprKind.(*exprpb.Expr_ListExpr)
+	if !ok {
+		return "", fmt.Errorf("in requires a list literal on the right-hand side")
+	}
+	elems := list.ListExpr.GetElements()
+	if len(elems) == 0 {
+		return "FALSE", nil
+	}
+	parts := make([]string, len(elems))
+	for i, e := range elems {
+		s, err := t.transpile(e)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = s
+	}
+	return lhs + " IN (" + strings.Join(parts, ", ") + ")", nil
 }
 
 // transpileLike renders the cel-go string membership functions

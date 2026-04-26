@@ -108,6 +108,15 @@ var _ = Describe("Transpile", func() {
 		Expect(args).To(Equal([]any{int64(-5)}))
 	})
 
+	It("renders `in` over a list literal as SQL IN", func() {
+		ast := mustCompile(`name in ["Alice", "Bob", "Carol"]`,
+			cel.Variable("name", cel.StringType))
+		where, args, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"name" IN ($1, $2, $3)`))
+		Expect(args).To(Equal([]any{"Alice", "Bob", "Carol"}))
+	})
+
 	It("supports comparisons between two columns", func() {
 		ast := mustCompile(`updated > created`,
 			cel.Variable("updated", cel.TimestampType),
@@ -494,6 +503,67 @@ var _ = Describe("transpiler internals", func() {
 			t := &transpiler{paramOffset: 1}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: overloads.Matches})
 			Expect(err).To(MatchError(ContainSubstring("matches expects 2 arguments")))
+		})
+
+		It("renders `in` with an empty list literal as FALSE", func() {
+			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			out, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: operators.In,
+				Args: []*exprpb.Expr{
+					{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
+					{ExprKind: &exprpb.Expr_ListExpr{ListExpr: &exprpb.Expr_CreateList{}}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal("FALSE"))
+		})
+
+		It("rejects `in` with the wrong arity", func() {
+			t := &transpiler{paramOffset: 1}
+			_, err := t.transpileCall(&exprpb.Expr_Call{Function: operators.In})
+			Expect(err).To(MatchError(ContainSubstring("in expects 2 arguments")))
+		})
+
+		It("rejects `in` when rhs is not a list literal", func() {
+			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: operators.In,
+				Args: []*exprpb.Expr{
+					{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
+					{ExprKind: &exprpb.Expr_ConstExpr{ConstExpr: &exprpb.Constant{
+						ConstantKind: &exprpb.Constant_StringValue{StringValue: "x"},
+					}}},
+				},
+			})
+			Expect(err).To(MatchError(ContainSubstring("in requires a list literal")))
+		})
+
+		It("propagates lhs errors from `in`", func() {
+			t := &transpiler{paramOffset: 1}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: operators.In,
+				Args: []*exprpb.Expr{
+					{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}}},
+					{ExprKind: &exprpb.Expr_ListExpr{ListExpr: &exprpb.Expr_CreateList{}}},
+				},
+			})
+			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
+		})
+
+		It("propagates element errors from `in`", func() {
+			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: operators.In,
+				Args: []*exprpb.Expr{
+					{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
+					{ExprKind: &exprpb.Expr_ListExpr{ListExpr: &exprpb.Expr_CreateList{
+						Elements: []*exprpb.Expr{
+							{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}}},
+						},
+					}}},
+				},
+			})
+			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
 		})
 
 		It("aliases unknown function names via WithFunctions", func() {
