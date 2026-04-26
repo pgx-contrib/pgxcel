@@ -13,14 +13,6 @@ import (
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
-// AIP-160 operator strings that cel-go's parser will not produce, but
-// that may reach Transpile via einride/aip-parsed CheckedExprs
-// translated through cel.CheckedExprToAst.
-const (
-	aipFunctionHas      = ":"
-	aipFunctionFuzzyAnd = "FUZZY"
-)
-
 // comparisonSQL maps cel-go comparison operator names to their SQL
 // rendering. The cel-go parser emits "_==_" / "_<_" / etc., which are
 // not valid SQL on their own.
@@ -38,6 +30,7 @@ type Option func(*config)
 
 type config struct {
 	columns     map[string]string
+	functions   map[string]string
 	paramOffset int
 }
 
@@ -47,6 +40,18 @@ type config struct {
 // When omitted, every ident in the AST errors.
 func WithColumns(columns map[string]string) Option {
 	return func(c *config) { c.columns = columns }
+}
+
+// WithFunctions registers aliases that are normalized to canonical CEL
+// function names before dispatch. Use this to feed in ASTs produced by
+// parsers other than cel-go — for example einride/aip-go emits "=" /
+// "AND" / "NOT" instead of operators.Equals / LogicalAnd / LogicalNot.
+//
+// Each map entry is alias → canonical, where canonical is one of the
+// names recognized by Transpile (typically a value from the cel-go
+// operators package). Unknown aliases are passed through unchanged.
+func WithFunctions(functions map[string]string) Option {
+	return func(c *config) { c.functions = functions }
 }
 
 // WithParamOffset sets the number of the first emitted placeholder.
@@ -78,7 +83,11 @@ func Transpile(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	t := &transpiler{columns: cfg.columns, paramOffset: cfg.paramOffset}
+	t := &transpiler{
+		columns:     cfg.columns,
+		functions:   cfg.functions,
+		paramOffset: cfg.paramOffset,
+	}
 	sql, err := t.transpile(checked.GetExpr())
 	if err != nil {
 		return "", nil, err
@@ -89,6 +98,7 @@ func Transpile(ast *cel.Ast, opts ...Option) (string, []any, error) {
 type transpiler struct {
 	args        []any
 	columns     map[string]string
+	functions   map[string]string
 	paramOffset int
 }
 
@@ -158,13 +168,20 @@ func (t *transpiler) transpileConst(c *exprpb.Constant) (string, error) {
 }
 
 func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
+	if alias, ok := t.functions[call.Function]; ok {
+		call = &exprpb.Expr_Call{
+			Target:   call.Target,
+			Function: alias,
+			Args:     call.Args,
+		}
+	}
 	switch call.Function {
 	case operators.Equals, operators.NotEquals,
 		operators.Less, operators.LessEquals,
 		operators.Greater, operators.GreaterEquals:
 		return t.transpileComparison(call)
 
-	case operators.LogicalAnd, aipFunctionFuzzyAnd:
+	case operators.LogicalAnd:
 		return t.transpileBinary(call, "AND")
 
 	case operators.LogicalOr:
@@ -180,19 +197,14 @@ func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
 		}
 		return "(NOT " + operand + ")", nil
 
-	case aipFunctionHas:
-		if len(call.Args) != 2 {
-			return "", fmt.Errorf(": expects 2 arguments, got %d", len(call.Args))
-		}
-		lhs, err := t.transpile(call.Args[0])
-		if err != nil {
-			return "", err
-		}
-		rhs, err := t.transpile(call.Args[1])
-		if err != nil {
-			return "", err
-		}
-		return lhs + " ILIKE '%' || " + rhs + " || '%'", nil
+	case overloads.Contains:
+		return t.transpileLike(call, true, true)
+	case overloads.StartsWith:
+		return t.transpileLike(call, false, true)
+	case overloads.EndsWith:
+		return t.transpileLike(call, true, false)
+	case overloads.Matches:
+		return t.transpileMatches(call)
 
 	case overloads.TypeConvertTimestamp:
 		return t.transpileTimeFunc(call, parseTimestamp)
@@ -243,6 +255,77 @@ func (t *transpiler) transpileBinary(call *exprpb.Expr_Call, op string) (string,
 		return "", err
 	}
 	return "(" + lhs + " " + op + " " + rhs + ")", nil
+}
+
+// transpileLike renders the cel-go string membership functions
+// (string.contains, string.startsWith, string.endsWith) as SQL LIKE
+// patterns. leadingPct/trailingPct control the wildcard placement:
+//
+//	contains:   leading=true  trailing=true   →  LIKE '%' || rhs || '%'
+//	startsWith: leading=false trailing=true   →  LIKE rhs || '%'
+//	endsWith:   leading=true  trailing=false  →  LIKE '%' || rhs
+//
+// Accepts both the method-style call (`s.contains(x)` → Target=s,
+// Args=[x]) and the function-style call (`contains(s, x)` → Target=nil,
+// Args=[s, x]) so callers that synthesize ASTs from non-cel-go parsers
+// (via WithFunctions aliases) work without an extra rewrite step.
+func (t *transpiler) transpileLike(call *exprpb.Expr_Call, leadingPct, trailingPct bool) (string, error) {
+	lhsExpr, rhsExpr, err := stringMethodArgs(call)
+	if err != nil {
+		return "", err
+	}
+	lhs, err := t.transpile(lhsExpr)
+	if err != nil {
+		return "", err
+	}
+	rhs, err := t.transpile(rhsExpr)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString(lhs)
+	sb.WriteString(" LIKE ")
+	if leadingPct {
+		sb.WriteString("'%' || ")
+	}
+	sb.WriteString(rhs)
+	if trailingPct {
+		sb.WriteString(" || '%'")
+	}
+	return sb.String(), nil
+}
+
+// transpileMatches renders string.matches(re) as POSIX regex (`~`).
+func (t *transpiler) transpileMatches(call *exprpb.Expr_Call) (string, error) {
+	lhsExpr, rhsExpr, err := stringMethodArgs(call)
+	if err != nil {
+		return "", err
+	}
+	lhs, err := t.transpile(lhsExpr)
+	if err != nil {
+		return "", err
+	}
+	rhs, err := t.transpile(rhsExpr)
+	if err != nil {
+		return "", err
+	}
+	return lhs + " ~ " + rhs, nil
+}
+
+// stringMethodArgs unpacks a CEL string method call into (receiver,
+// argument) regardless of whether the AST uses the method form (Target
+// set, one Arg) or the function form (no Target, two Args).
+func stringMethodArgs(call *exprpb.Expr_Call) (lhs, rhs *exprpb.Expr, err error) {
+	if call.Target != nil {
+		if len(call.Args) != 1 {
+			return nil, nil, fmt.Errorf("%s expects 1 argument, got %d", call.Function, len(call.Args))
+		}
+		return call.Target, call.Args[0], nil
+	}
+	if len(call.Args) != 2 {
+		return nil, nil, fmt.Errorf("%s expects 2 arguments, got %d", call.Function, len(call.Args))
+	}
+	return call.Args[0], call.Args[1], nil
 }
 
 // transpileTimeFunc binds timestamp("...") / duration("...") literals

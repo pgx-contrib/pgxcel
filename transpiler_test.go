@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/overloads"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
@@ -147,6 +149,7 @@ var _ = Describe("Transpile", func() {
 		_, _, err := Transpile(ast)
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "name"`)))
 	})
+
 })
 
 var _ = Describe("transpiler internals", func() {
@@ -329,38 +332,6 @@ var _ = Describe("transpiler internals", func() {
 			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
 		})
 
-		It("rejects has (`:`) with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
-			_, err := t.transpileCall(&exprpb.Expr_Call{Function: ":"})
-			Expect(err).To(MatchError(ContainSubstring(": expects 2 arguments")))
-		})
-
-		It("propagates lhs errors from `:`", func() {
-			t := &transpiler{paramOffset: 1}
-			bad := &exprpb.Expr{
-				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
-			}
-			rhs := &exprpb.Expr{
-				ExprKind: &exprpb.Expr_ConstExpr{ConstExpr: &exprpb.Constant{
-					ConstantKind: &exprpb.Constant_StringValue{StringValue: "x"},
-				}},
-			}
-			_, err := t.transpileCall(&exprpb.Expr_Call{Function: ":", Args: []*exprpb.Expr{bad, rhs}})
-			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
-		})
-
-		It("propagates rhs errors from `:`", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
-			lhs := &exprpb.Expr{
-				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}},
-			}
-			bad := &exprpb.Expr{
-				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
-			}
-			_, err := t.transpileCall(&exprpb.Expr_Call{Function: ":", Args: []*exprpb.Expr{lhs, bad}})
-			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
-		})
-
 		It("rejects timestamp() with the wrong arity", func() {
 			t := &transpiler{paramOffset: 1}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: "timestamp"})
@@ -408,13 +379,40 @@ var _ = Describe("transpiler internals", func() {
 			Expect(err).To(MatchError(ContainSubstring("timestamp")))
 		})
 
-		It("emits ILIKE for the AIP-160 has operator", func() {
+		DescribeTable("renders CEL string membership functions as LIKE",
+			func(fn, expected string) {
+				t := &transpiler{
+					paramOffset: 1,
+					columns:     map[string]string{"name": "name"},
+				}
+				out, err := t.transpileCall(&exprpb.Expr_Call{
+					Function: fn,
+					Target:   &exprpb.Expr{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
+					Args: []*exprpb.Expr{
+						{ExprKind: &exprpb.Expr_ConstExpr{
+							ConstExpr: &exprpb.Constant{
+								ConstantKind: &exprpb.Constant_StringValue{StringValue: "ali"},
+							},
+						}},
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(out).To(Equal(expected))
+				Expect(t.args).To(Equal([]any{"ali"}))
+			},
+			Entry("contains",   overloads.Contains,   `"name" LIKE '%' || $1 || '%'`),
+			Entry("startsWith", overloads.StartsWith, `"name" LIKE $1 || '%'`),
+			Entry("endsWith",   overloads.EndsWith,   `"name" LIKE '%' || $1`),
+			Entry("matches",    overloads.Matches,    `"name" ~ $1`),
+		)
+
+		It("accepts the function-style call shape (no Target, two Args)", func() {
 			t := &transpiler{
 				paramOffset: 1,
 				columns:     map[string]string{"name": "name"},
 			}
 			out, err := t.transpileCall(&exprpb.Expr_Call{
-				Function: ":",
+				Function: overloads.Contains,
 				Args: []*exprpb.Expr{
 					{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
 					{ExprKind: &exprpb.Expr_ConstExpr{
@@ -425,14 +423,84 @@ var _ = Describe("transpiler internals", func() {
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(out).To(Equal(`"name" ILIKE '%' || $1 || '%'`))
-			Expect(t.args).To(Equal([]any{"ali"}))
+			Expect(out).To(Equal(`"name" LIKE '%' || $1 || '%'`))
 		})
 
-		It("treats AIP-160 FUZZY as a logical AND", func() {
+		It("rejects a string method call with the wrong arity", func() {
+			t := &transpiler{paramOffset: 1}
+			_, err := t.transpileCall(&exprpb.Expr_Call{Function: overloads.Contains})
+			Expect(err).To(MatchError(ContainSubstring("contains expects 2 arguments")))
+		})
+
+		It("propagates receiver errors from a string method call", func() {
+			t := &transpiler{paramOffset: 1}
+			bad := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
+			}
+			rhs := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_ConstExpr{ConstExpr: &exprpb.Constant{
+					ConstantKind: &exprpb.Constant_StringValue{StringValue: "x"},
+				}},
+			}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: overloads.Contains,
+				Args:     []*exprpb.Expr{bad, rhs},
+			})
+			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
+		})
+
+		It("propagates argument errors from a string method call", func() {
+			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			lhs := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}},
+			}
+			bad := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
+			}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: overloads.Contains,
+				Args:     []*exprpb.Expr{lhs, bad},
+			})
+			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
+		})
+
+		It("rejects a string method call with too many args in method form", func() {
+			t := &transpiler{paramOffset: 1}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: overloads.Contains,
+				Target:   &exprpb.Expr{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
+			})
+			Expect(err).To(MatchError(ContainSubstring("contains expects 1 argument")))
+		})
+
+		It("propagates receiver errors from matches", func() {
+			t := &transpiler{paramOffset: 1}
+			bad := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
+			}
+			rhs := &exprpb.Expr{
+				ExprKind: &exprpb.Expr_ConstExpr{ConstExpr: &exprpb.Constant{
+					ConstantKind: &exprpb.Constant_StringValue{StringValue: "x"},
+				}},
+			}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: overloads.Matches,
+				Args:     []*exprpb.Expr{bad, rhs},
+			})
+			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
+		})
+
+		It("rejects matches with the wrong arity", func() {
+			t := &transpiler{paramOffset: 1}
+			_, err := t.transpileCall(&exprpb.Expr_Call{Function: overloads.Matches})
+			Expect(err).To(MatchError(ContainSubstring("matches expects 2 arguments")))
+		})
+
+		It("aliases unknown function names via WithFunctions", func() {
 			t := &transpiler{
 				paramOffset: 1,
 				columns:     map[string]string{"name": "name", "age": "age"},
+				functions:   map[string]string{"FUZZY": operators.LogicalAnd},
 			}
 			lhs := &exprpb.Expr{ExprKind: &exprpb.Expr_CallExpr{CallExpr: &exprpb.Expr_Call{
 				Function: "_==_",
