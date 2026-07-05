@@ -3,7 +3,7 @@ module github.com/pgx-contrib/pgxcel
 go 1.25.8
 
 require (
-	github.com/google/cel-go v0.28.1
+	github.com/google/cel-go v0.29.1
 	github.com/onsi/ginkgo/v2 v2.32.0
 	github.com/onsi/gomega v1.42.1
 	google.golang.org/genproto/googleapis/api v0.0.0-20260420184626-e10c466a9529
