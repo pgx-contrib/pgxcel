@@ -5,7 +5,7 @@ go 1.25.8
 require (
 	github.com/google/cel-go v0.31.0
 	github.com/onsi/ginkgo/v2 v2.32.1
-	github.com/onsi/gomega v1.42.1
+	github.com/onsi/gomega v1.43.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260420184626-e10c466a9529
 )
 
