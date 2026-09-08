@@ -3,9 +3,9 @@ package pgxcel
 import (
 	"time"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/overloads"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/overloads"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
@@ -409,10 +409,10 @@ var _ = Describe("transpiler internals", func() {
 				Expect(out).To(Equal(expected))
 				Expect(t.args).To(Equal([]any{"ali"}))
 			},
-			Entry("contains",   overloads.Contains,   `"name" LIKE '%' || $1 || '%'`),
+			Entry("contains", overloads.Contains, `"name" LIKE '%' || $1 || '%'`),
 			Entry("startsWith", overloads.StartsWith, `"name" LIKE $1 || '%'`),
-			Entry("endsWith",   overloads.EndsWith,   `"name" LIKE '%' || $1`),
-			Entry("matches",    overloads.Matches,    `"name" ~ $1`),
+			Entry("endsWith", overloads.EndsWith, `"name" LIKE '%' || $1`),
+			Entry("matches", overloads.Matches, `"name" ~ $1`),
 		)
 
 		It("accepts the function-style call shape (no Target, two Args)", func() {
