@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/overloads"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/overloads"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
