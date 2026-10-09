@@ -49,7 +49,7 @@ var _ = Describe("Where", func() {
 			cel.Variable("id", cel.IntType),
 			cel.Variable("other", cel.IntType))
 		_, _, err := Where(ast, WithColumns(map[string]string{"id": "id"}))
-		Expect(err).To(MatchError(ContainSubstring(`unknown field "other"`)))
+		Expect(err).To(MatchError(`pgxcel: unknown field "other"`))
 	})
 
 	It("combines AND with parentheses per branch", func() {
@@ -664,15 +664,9 @@ var _ = Describe("transpiler internals", func() {
 })
 
 var _ = Describe("transpileComparison", func() {
-	It("rejects an unmapped operator", func() {
-		t := &transpiler{paramOffset: 1}
-		_, err := t.transpileComparison(&exprpb.Expr_Call{Function: "_~_"})
-		Expect(err).To(MatchError(ContainSubstring(`unsupported comparison "_~_"`)))
-	})
-
 	It("rejects the wrong number of arguments", func() {
 		t := &transpiler{paramOffset: 1}
-		_, err := t.transpileComparison(&exprpb.Expr_Call{Function: "_==_"})
+		_, err := t.transpileCall(&exprpb.Expr_Call{Function: operators.Equals})
 		Expect(err).To(MatchError(ContainSubstring("= expects 2 arguments")))
 	})
 })

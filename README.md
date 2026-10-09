@@ -57,11 +57,13 @@ where, args, err := pgxcel.Where(ast, pgxcel.WithColumns(columns))
   emits `"="` / `"AND"` / `"NOT"` instead of the cel-go operator
   names). Unknown aliases pass through unchanged.
 - `pgxcel.WithParamOffset(int)` — the first placeholder number.
-  Defaults to `1`. Use a higher value when splicing the fragment into
-  a query that already has bound values.
+  Defaults to `1`; values below `1` return an error. Use a higher
+  value when splicing the fragment into a query that already has
+  bound values.
 
 A nil ast returns `("", nil, nil)`. An unchecked ast
-(`ast.IsChecked() == false`) returns an error.
+(`ast.IsChecked() == false`) returns an error. Errors are prefixed
+with `pgxcel:`.
 
 ## Operator coverage
 
@@ -71,13 +73,31 @@ A nil ast returns `("", nil, nil)`. An unchecked ast
 | `&&`, `\|\|`                         | `(lhs AND rhs)` / `(lhs OR rhs)`        |
 | `!`                                  | `(NOT expr)`                            |
 | `x in [a, b, c]`                     | `x IN ($1, $2, $3)` (empty → `FALSE`)   |
-| `s.contains(x)`                      | `s LIKE '%' \|\| $N \|\| '%'`           |
+| `s.contains(x)`                      | `s LIKE '%' \|\| $N \|\| '%'` (escaped) |
 | `s.startsWith(x)`                    | `s LIKE $N \|\| '%'`                    |
 | `s.endsWith(x)`                      | `s LIKE '%' \|\| $N`                    |
 | `s.matches(re)`                      | `s ~ $N` (POSIX regex)                  |
 | `timestamp("2025-01-02T03:04:05Z")`  | `$N` bound as `time.Time`               |
 | `duration("1h30m")`                  | `$N` bound as `time.Duration`           |
 | unary `-<literal>`                   | bound as signed numeric literal         |
+
+The `contains` / `startsWith` / `endsWith` argument has its LIKE
+metacharacters (`%`, `_`, `\`) escaped so it matches literally, as in
+CEL. Comparison, `IN`, `LIKE` and `~` predicates nested as operands of
+another operator are parenthesized to preserve CEL precedence.
+
+### Limitations
+
+- Anything not listed above is rejected with an error, including
+  `has()`, comprehension macros (`all`, `exists`, ...), arithmetic,
+  the ternary operator, `null` and bytes literals, and negating a
+  non-literal.
+- `in` requires a list literal on the right-hand side.
+- `matches` uses Postgres POSIX regular expressions, not RE2; patterns
+  relying on RE2-only syntax behave differently.
+- SQL three-valued logic applies: a predicate on a `NULL` column is
+  `NULL`, so rows with `NULL` values are excluded by both `x == v` and
+  `!(x == v)`.
 
 ## Development
 

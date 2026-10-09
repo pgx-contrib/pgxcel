@@ -25,22 +25,21 @@ var comparisonSQL = map[string]string{
 	operators.GreaterEquals: ">=",
 }
 
-// infixPredicates lists the canonical functions rendered as bare infix
-// SQL (no enclosing parentheses). SQL precedence differs from CEL's (IN
-// and LIKE bind tighter than =, and = is non-associative), so these are
-// parenthesized whenever they appear as an operand of another operator.
-var infixPredicates = map[string]bool{
-	operators.Equals:        true,
-	operators.NotEquals:     true,
-	operators.Less:          true,
-	operators.LessEquals:    true,
-	operators.Greater:       true,
-	operators.GreaterEquals: true,
-	operators.In:            true,
-	overloads.Contains:      true,
-	overloads.StartsWith:    true,
-	overloads.EndsWith:      true,
-	overloads.Matches:       true,
+// isInfixPredicate reports whether the canonical function fn renders
+// as bare infix SQL (no enclosing parentheses). SQL precedence differs
+// from CEL's (IN and LIKE bind tighter than =, and = is
+// non-associative), so such predicates are parenthesized whenever they
+// appear as an operand of another operator.
+func isInfixPredicate(fn string) bool {
+	if _, ok := comparisonSQL[fn]; ok {
+		return true
+	}
+	switch fn {
+	case operators.In, overloads.Contains, overloads.StartsWith, overloads.EndsWith, overloads.Matches:
+		return true
+	default:
+		return false
+	}
 }
 
 // likeEscaper escapes the LIKE metacharacters in a literal pattern
@@ -117,7 +116,7 @@ func Where(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	}
 	sql, err := t.transpile(checked.GetExpr())
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("pgxcel: %w", err)
 	}
 	return sql, t.args, nil
 }
@@ -206,10 +205,21 @@ func (t *transpiler) operand(e *exprpb.Expr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c, ok := e.ExprKind.(*exprpb.Expr_CallExpr); ok && infixPredicates[t.resolve(c.CallExpr).Function] {
+	if c, ok := e.ExprKind.(*exprpb.Expr_CallExpr); ok && isInfixPredicate(t.resolve(c.CallExpr).Function) {
 		return "(" + s + ")", nil
 	}
 	return s, nil
+}
+
+// operands transpiles the two sides of an infix operator via operand.
+func (t *transpiler) operands(lhsExpr, rhsExpr *exprpb.Expr) (lhs, rhs string, err error) {
+	if lhs, err = t.operand(lhsExpr); err != nil {
+		return "", "", err
+	}
+	if rhs, err = t.operand(rhsExpr); err != nil {
+		return "", "", err
+	}
+	return lhs, rhs, nil
 }
 
 // resolve returns call with its function name normalized through the
@@ -228,12 +238,10 @@ func (t *transpiler) resolve(call *exprpb.Expr_Call) *exprpb.Expr_Call {
 
 func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
 	call = t.resolve(call)
+	if op, ok := comparisonSQL[call.Function]; ok {
+		return t.transpileComparison(call, op)
+	}
 	switch call.Function {
-	case operators.Equals, operators.NotEquals,
-		operators.Less, operators.LessEquals,
-		operators.Greater, operators.GreaterEquals:
-		return t.transpileComparison(call)
-
 	case operators.LogicalAnd:
 		return t.transpileBinary(call, "AND")
 
@@ -279,23 +287,15 @@ func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
 // transpileComparison handles =, !=, <, <=, >, >=. Each side may be an
 // identifier (resolved through the column map) or a literal (bound as a
 // placeholder). Column-to-column comparisons are supported.
-func (t *transpiler) transpileComparison(call *exprpb.Expr_Call) (string, error) {
-	op, ok := comparisonSQL[call.Function]
-	if !ok {
-		return "", fmt.Errorf("unsupported comparison %q", call.Function)
-	}
+func (t *transpiler) transpileComparison(call *exprpb.Expr_Call, op string) (string, error) {
 	if len(call.Args) != 2 {
 		return "", fmt.Errorf("%s expects 2 arguments, got %d", op, len(call.Args))
 	}
-	lhs, err := t.operand(call.Args[0])
+	lhs, rhs, err := t.operands(call.Args[0], call.Args[1])
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.operand(call.Args[1])
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%s %s %s", lhs, op, rhs), nil
+	return lhs + " " + op + " " + rhs, nil
 }
 
 func (t *transpiler) transpileBinary(call *exprpb.Expr_Call, op string) (string, error) {
@@ -402,11 +402,7 @@ func (t *transpiler) transpileMatches(call *exprpb.Expr_Call) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lhs, err := t.operand(lhsExpr)
-	if err != nil {
-		return "", err
-	}
-	rhs, err := t.operand(rhsExpr)
+	lhs, rhs, err := t.operands(lhsExpr, rhsExpr)
 	if err != nil {
 		return "", err
 	}
@@ -451,8 +447,7 @@ func (t *transpiler) transpileTimeFunc(
 }
 
 // transpileUnaryMinus folds -<literal> into a single signed
-// placeholder. Anything else (e.g. -column) is rejected; CEL's type
-// checker normally blocks those before reaching us.
+// placeholder. Negating anything else (e.g. -column) is rejected.
 func (t *transpiler) transpileUnaryMinus(call *exprpb.Expr_Call) (string, error) {
 	if len(call.Args) != 1 {
 		return "", fmt.Errorf("unary minus expects 1 argument, got %d", len(call.Args))
