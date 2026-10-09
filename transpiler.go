@@ -140,9 +140,9 @@ func isBoolType(t *types.Type) bool {
 		t.Kind() == types.DynKind
 }
 
-// typeOf returns the checked type of e, with wrapper types unwrapped to
-// their primitive. It returns nil when the type is unknown or dyn.
-func (t *transpiler) typeOf(e *exprpb.Expr) *types.Type {
+// checkedType returns the checked type of e, with wrapper types
+// unwrapped to their primitive, or nil when e has no checked type.
+func (t *transpiler) checkedType(e *exprpb.Expr) *types.Type {
 	typ, ok := t.types[e.GetId()]
 	if !ok {
 		return nil
@@ -151,17 +151,35 @@ func (t *transpiler) typeOf(e *exprpb.Expr) *types.Type {
 		typ = &exprpb.Type{TypeKind: &exprpb.Type_Primitive{Primitive: w.Wrapper}}
 	}
 	out, err := types.ExprTypeToType(typ)
-	if err != nil || out.Kind() == types.DynKind {
+	if err != nil {
 		return nil
 	}
 	return out
+}
+
+// isDyn reports whether e is checked as dyn or google.protobuf.Any,
+// i.e. its concrete type is only known at runtime.
+func (t *transpiler) isDyn(e *exprpb.Expr) bool {
+	typ := t.checkedType(e)
+	return typ != nil && (typ.Kind() == types.DynKind || typ.Kind() == types.AnyKind)
+}
+
+// typeOf returns the checked type of e, or nil when it is unknown, dyn
+// or google.protobuf.Any.
+func (t *transpiler) typeOf(e *exprpb.Expr) *types.Type {
+	if t.isDyn(e) {
+		return nil
+	}
+	return t.checkedType(e)
 }
 
 // checkSameType rejects operands whose checked types differ. CEL
 // permits mixing types through list(dyn) literals or
 // cel.CrossTypeNumericComparisons, but Postgres infers a single type
 // for both sides and pgx then coerces the bound value (truncating 8.6
-// to 8, parsing "8" as 8), silently changing the result.
+// to 8, parsing "8" as 8), silently changing the result. Dyn operands
+// pass here; literals compared with them are cast instead (see
+// castLiteral).
 func (t *transpiler) checkSameType(a, b *exprpb.Expr) error {
 	ta, tb := t.typeOf(a), t.typeOf(b)
 	if ta == nil || tb == nil || ta.IsExactType(tb) {
@@ -171,9 +189,10 @@ func (t *transpiler) checkSameType(a, b *exprpb.Expr) error {
 }
 
 // literalType returns the Postgres type of e when e renders as a single
-// bound literal. Postgres cannot infer a placeholder's type when the
-// other side is also a placeholder, so such operands get an explicit
-// cast.
+// bound literal. Literals get an explicit cast when Postgres cannot
+// infer their CEL type from the other operand: when it is another
+// placeholder, or a dyn value whose column type may differ (binding
+// 8.6 against a bigint column would truncate it).
 func (t *transpiler) literalType(e *exprpb.Expr) (string, bool) {
 	switch v := e.ExprKind.(type) {
 	case *exprpb.Expr_ConstExpr:
@@ -206,14 +225,14 @@ func (t *transpiler) literalType(e *exprpb.Expr) (string, bool) {
 }
 
 // castLiteral appends an explicit cast to sql, the rendering of e, when
-// e is a bound literal and every one of others is too.
+// e is a bound literal and every one of others is a literal or dyn.
 func (t *transpiler) castLiteral(sql string, e *exprpb.Expr, others ...*exprpb.Expr) string {
 	typ, ok := t.literalType(e)
 	if !ok {
 		return sql
 	}
 	for _, o := range others {
-		if _, ok := t.literalType(o); !ok {
+		if _, ok := t.literalType(o); !ok && !t.isDyn(o) {
 			return sql
 		}
 	}
@@ -391,6 +410,9 @@ func (t *transpiler) transpileComparison(call *exprpb.Expr_Call, op string) (str
 		return "", err
 	}
 	lhs = t.castLiteral(lhs, call.Args[0], call.Args[1])
+	if t.isDyn(call.Args[0]) {
+		rhs = t.castLiteral(rhs, call.Args[1])
+	}
 	return lhs + " " + op + " " + rhs, nil
 }
 
@@ -439,11 +461,15 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 		}
 	}
 	lhs = t.castLiteral(lhs, call.Args[0], elems...)
+	dyn := t.isDyn(call.Args[0])
 	parts := make([]string, len(elems))
 	for i, e := range elems {
 		s, err := t.transpile(e)
 		if err != nil {
 			return "", err
+		}
+		if dyn {
+			s = t.castLiteral(s, e)
 		}
 		parts[i] = s
 	}
@@ -589,11 +615,15 @@ func stringLiteral(e *exprpb.Expr) (string, bool) {
 // parseTimestamp parses an RFC 3339 timestamp and normalizes it to UTC.
 // pgx drops the zone when binding to a timestamp (without time zone)
 // column, so a non-UTC offset would otherwise select a different
-// instant than CEL does.
+// instant than CEL does. Sub-microsecond precision, which Postgres
+// would silently truncate, is rejected.
 func parseTimestamp(s string) (any, error) {
 	ts, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return nil, err
+	}
+	if ts.Nanosecond()%int(time.Microsecond) != 0 {
+		return nil, fmt.Errorf("%q has sub-microsecond precision, which a Postgres timestamp cannot represent", s)
 	}
 	return ts.UTC(), nil
 }

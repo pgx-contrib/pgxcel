@@ -256,6 +256,26 @@ var _ = Describe("Where", func() {
 		Expect(args).To(Equal([]any{time.Date(2025, 1, 2, 1, 4, 5, 0, time.UTC)}))
 	})
 
+	It("rejects timestamps with sub-microsecond precision", func() {
+		ast := mustCompile(`ts >= timestamp("2025-01-02T01:04:05.0000005Z")`, cel.Variable("ts", cel.TimestampType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"ts": "ts"}))
+		Expect(err).To(MatchError(ContainSubstring("sub-microsecond precision")))
+	})
+
+	DescribeTable("casts literals compared with a dyn operand",
+		func(src string, typ *cel.Type, expected string) {
+			ast := mustCompile(src, cel.Variable("x", typ))
+			where, _, err := Where(ast, WithColumns(map[string]string{"x": "x"}))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(where).To(Equal(expected))
+		},
+		Entry("comparison", `x == 8.6`, cel.DynType, `"x" = $1::double precision`),
+		Entry("negated literal", `x < -1`, cel.DynType, `"x" < $1::bigint`),
+		Entry("in list", `x in [1, "8"]`, cel.DynType, `"x" IN ($1::bigint, $2::text)`),
+		Entry("literal lhs", `8.6 == x`, cel.DynType, `$1::double precision = "x"`),
+		Entry("google.protobuf.Any", `x == 1`, cel.AnyType, `"x" = $1::bigint`),
+	)
+
 	It("rejects durations with sub-microsecond precision", func() {
 		ast := mustCompile(`d == duration("1ns")`, cel.Variable("d", cel.DurationType))
 		_, _, err := Where(ast, WithColumns(map[string]string{"d": "d"}))

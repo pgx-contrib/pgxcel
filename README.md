@@ -100,12 +100,15 @@ so Postgres can infer the parameter types.
 - Both sides of a comparison, and every `in` element, must have the
   same CEL type. Mixed types (`age in [1, 2.5]`, or `age < 2.5` with
   `cel.CrossTypeNumericComparisons`) are rejected, since Postgres
-  would coerce the bound value to the column type.
-- `duration(...)` literals must be whole microseconds, the precision
-  of a Postgres `interval`.
-- Literals are bound without a cast, so a value outside the column's
-  range (e.g. `3000000000` against an `integer` column) fails at query
-  time rather than comparing as CEL would.
+  would coerce the bound value to the column type. A literal compared
+  with a `dyn` (or `google.protobuf.Any`) operand is instead cast to
+  its CEL type, so Postgres either compares as CEL would or errors.
+- `timestamp(...)` and `duration(...)` literals must be whole
+  microseconds, the precision of Postgres `timestamp` / `interval`.
+- Literals compared with a typed column are bound without a cast, so
+  a value outside the column's range (e.g. `3000000000` against an
+  `integer` column) fails at query time rather than comparing as CEL
+  would.
 - String ordering (`<`, `>`, ...) follows the column's collation,
   whereas CEL compares by code point.
 - `matches` uses Postgres POSIX regular expressions, not RE2; patterns
