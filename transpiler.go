@@ -4,12 +4,14 @@ package pgxcel
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
@@ -24,6 +26,27 @@ var comparisonSQL = map[string]string{
 	operators.Greater:       ">",
 	operators.GreaterEquals: ">=",
 }
+
+// isInfixPredicate reports whether the canonical function fn renders
+// as bare infix SQL (no enclosing parentheses). SQL precedence differs
+// from CEL's (IN and LIKE bind tighter than =, and = is
+// non-associative), so such predicates are parenthesized whenever they
+// appear as an operand of another operator.
+func isInfixPredicate(fn string) bool {
+	if _, ok := comparisonSQL[fn]; ok {
+		return true
+	}
+	switch fn {
+	case operators.In, overloads.Contains, overloads.StartsWith, overloads.EndsWith, overloads.Matches:
+		return true
+	default:
+		return false
+	}
+}
+
+// likeEscaper escapes the LIKE metacharacters in a literal pattern
+// using the default backslash escape character.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // Option configures a Where call.
 type Option func(*config)
@@ -49,7 +72,8 @@ func WithColumns(columns map[string]string) Option {
 //
 // Each map entry is alias → canonical, where canonical is one of the
 // names recognized by Where (typically a value from the cel-go
-// operators package). Unknown aliases are passed through unchanged.
+// operators package). Function names absent from the map are used
+// unchanged; aliases are not chained.
 func WithFunctions(functions map[string]string) Option {
 	return func(c *config) { c.functions = functions }
 }
@@ -57,22 +81,24 @@ func WithFunctions(functions map[string]string) Option {
 // WithParamOffset sets the number of the first emitted placeholder.
 // Placeholders are then numbered offset, offset+1, ... so callers can
 // splice the fragment into a query that already has earlier bound
-// values. Defaults to 1.
+// values. Defaults to 1; values below 1 make Where return an error.
 func WithParamOffset(n int) Option {
 	return func(c *config) { c.paramOffset = n }
 }
 
-// Where turns ast into a Postgres WHERE fragment (no enclosing
-// parentheses) plus the bound positional args. The fragment does not
-// include the WHERE keyword, so it can also be spliced into any other
-// boolean context such as HAVING or JOIN ... ON.
+// Where turns ast into a Postgres boolean expression plus the bound
+// positional args. The fragment does not include the WHERE keyword, so
+// it can also be spliced into any other boolean context such as HAVING
+// or JOIN ... ON. It is not guaranteed to be parenthesized; wrap it
+// before combining it with other SQL operators.
 //
-// ast must be checked (ast.IsChecked() == true). An unchecked AST
-// returns an error. A nil ast returns ("", nil, nil) — the caller
-// decides whether to omit the WHERE keyword.
+// ast must be checked (ast.IsChecked() == true) and its output type
+// must be bool; anything else returns an error. A nil ast returns
+// ("", nil, nil) — the caller decides whether to omit the WHERE
+// keyword.
 //
-// Configure resolution and placeholder numbering via WithColumns and
-// WithParamOffset.
+// Configure resolution, aliasing and placeholder numbering via
+// WithColumns, WithFunctions and WithParamOffset.
 func Where(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	if ast == nil {
 		return "", nil, nil
@@ -81,27 +107,136 @@ func Where(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("pgxcel: %w", err)
 	}
+	if out := ast.OutputType(); !isBoolType(out) {
+		return "", nil, fmt.Errorf("pgxcel: expression must evaluate to bool, got %s", out)
+	}
 	cfg := config{paramOffset: 1}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	t := &transpiler{
-		columns:     cfg.columns,
-		functions:   cfg.functions,
-		paramOffset: cfg.paramOffset,
+	if cfg.paramOffset < 1 {
+		return "", nil, fmt.Errorf("pgxcel: param offset must be at least 1, got %d", cfg.paramOffset)
 	}
+	t := &transpiler{config: cfg, types: checked.GetTypeMap()}
 	sql, err := t.transpile(checked.GetExpr())
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("pgxcel: %w", err)
 	}
 	return sql, t.args, nil
 }
 
 type transpiler struct {
-	args        []any
-	columns     map[string]string
-	functions   map[string]string
-	paramOffset int
+	config
+	args []any
+	// types is the checker's expression id → type map. It may be nil,
+	// in which case operand type checks are skipped.
+	types map[int64]*exprpb.Type
+}
+
+// isBoolType reports whether t is bool, nullable bool or dyn.
+func isBoolType(t *types.Type) bool {
+	return t.IsExactType(types.BoolType) ||
+		t.IsExactType(types.NewNullableType(types.BoolType)) ||
+		t.Kind() == types.DynKind
+}
+
+// checkedType returns the checked type of e, with wrapper types
+// unwrapped to their primitive, or nil when e has no checked type.
+func (t *transpiler) checkedType(e *exprpb.Expr) *types.Type {
+	typ, ok := t.types[e.GetId()]
+	if !ok {
+		return nil
+	}
+	if w, ok := typ.GetTypeKind().(*exprpb.Type_Wrapper); ok {
+		typ = &exprpb.Type{TypeKind: &exprpb.Type_Primitive{Primitive: w.Wrapper}}
+	}
+	out, err := types.ExprTypeToType(typ)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// isDyn reports whether e is checked as dyn or google.protobuf.Any,
+// i.e. its concrete type is only known at runtime.
+func (t *transpiler) isDyn(e *exprpb.Expr) bool {
+	typ := t.checkedType(e)
+	return typ != nil && (typ.Kind() == types.DynKind || typ.Kind() == types.AnyKind)
+}
+
+// typeOf returns the checked type of e, or nil when it is unknown, dyn
+// or google.protobuf.Any.
+func (t *transpiler) typeOf(e *exprpb.Expr) *types.Type {
+	if t.isDyn(e) {
+		return nil
+	}
+	return t.checkedType(e)
+}
+
+// checkSameType rejects operands whose checked types differ. CEL
+// permits mixing types through list(dyn) literals or
+// cel.CrossTypeNumericComparisons, but Postgres infers a single type
+// for both sides and pgx then coerces the bound value (truncating 8.6
+// to 8, parsing "8" as 8), silently changing the result. Dyn operands
+// pass here; literals compared with them are cast instead (see
+// castLiteral).
+func (t *transpiler) checkSameType(a, b *exprpb.Expr) error {
+	ta, tb := t.typeOf(a), t.typeOf(b)
+	if ta == nil || tb == nil || ta.IsExactType(tb) {
+		return nil
+	}
+	return fmt.Errorf("cannot compare %s with %s", ta, tb)
+}
+
+// literalType returns the Postgres type of e when e renders as a single
+// bound literal. Literals get an explicit cast when Postgres cannot
+// infer their CEL type from the other operand: when it is another
+// placeholder, or a dyn value whose column type may differ (binding
+// 8.6 against a bigint column would truncate it).
+func (t *transpiler) literalType(e *exprpb.Expr) (string, bool) {
+	switch v := e.ExprKind.(type) {
+	case *exprpb.Expr_ConstExpr:
+		switch v.ConstExpr.ConstantKind.(type) {
+		case *exprpb.Constant_StringValue:
+			return "text", true
+		case *exprpb.Constant_Int64Value:
+			return "bigint", true
+		case *exprpb.Constant_Uint64Value:
+			return "numeric", true
+		case *exprpb.Constant_DoubleValue:
+			return "double precision", true
+		case *exprpb.Constant_BoolValue:
+			return "boolean", true
+		}
+	case *exprpb.Expr_CallExpr:
+		call := t.resolve(v.CallExpr)
+		switch call.Function {
+		case overloads.TypeConvertTimestamp:
+			return "timestamptz", true
+		case overloads.TypeConvertDuration:
+			return "interval", true
+		case operators.Negate:
+			if len(call.Args) == 1 {
+				return t.literalType(call.Args[0])
+			}
+		}
+	}
+	return "", false
+}
+
+// castLiteral appends an explicit cast to sql, the rendering of e, when
+// e is a bound literal and every one of others is a literal or dyn.
+func (t *transpiler) castLiteral(sql string, e *exprpb.Expr, others ...*exprpb.Expr) string {
+	typ, ok := t.literalType(e)
+	if !ok {
+		return sql
+	}
+	for _, o := range others {
+		if _, ok := t.literalType(o); !ok && !t.isDyn(o) {
+			return sql
+		}
+	}
+	return sql + "::" + typ
 }
 
 func (t *transpiler) placeholder(v any) string {
@@ -113,7 +248,12 @@ func (t *transpiler) transpile(e *exprpb.Expr) (string, error) {
 	switch v := e.ExprKind.(type) {
 	case *exprpb.Expr_ConstExpr:
 		return t.transpileConst(v.ConstExpr)
-	case *exprpb.Expr_IdentExpr, *exprpb.Expr_SelectExpr:
+	case *exprpb.Expr_SelectExpr:
+		if v.SelectExpr.TestOnly {
+			return "", fmt.Errorf("has() is not supported")
+		}
+		return t.transpileIdent(e)
+	case *exprpb.Expr_IdentExpr:
 		return t.transpileIdent(e)
 	case *exprpb.Expr_CallExpr:
 		return t.transpileCall(v.CallExpr)
@@ -169,20 +309,50 @@ func (t *transpiler) transpileConst(c *exprpb.Constant) (string, error) {
 	}
 }
 
+// operand transpiles e for use as an operand of an infix operator,
+// parenthesizing it when it is itself a bare infix predicate.
+func (t *transpiler) operand(e *exprpb.Expr) (string, error) {
+	s, err := t.transpile(e)
+	if err != nil {
+		return "", err
+	}
+	if c, ok := e.ExprKind.(*exprpb.Expr_CallExpr); ok && isInfixPredicate(t.resolve(c.CallExpr).Function) {
+		return "(" + s + ")", nil
+	}
+	return s, nil
+}
+
+// operands transpiles the two sides of an infix operator via operand.
+func (t *transpiler) operands(lhsExpr, rhsExpr *exprpb.Expr) (lhs, rhs string, err error) {
+	if lhs, err = t.operand(lhsExpr); err != nil {
+		return "", "", err
+	}
+	if rhs, err = t.operand(rhsExpr); err != nil {
+		return "", "", err
+	}
+	return lhs, rhs, nil
+}
+
+// resolve returns call with its function name normalized through the
+// WithFunctions aliases.
+func (t *transpiler) resolve(call *exprpb.Expr_Call) *exprpb.Expr_Call {
+	alias, ok := t.functions[call.Function]
+	if !ok {
+		return call
+	}
+	return &exprpb.Expr_Call{
+		Target:   call.Target,
+		Function: alias,
+		Args:     call.Args,
+	}
+}
+
 func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
-	if alias, ok := t.functions[call.Function]; ok {
-		call = &exprpb.Expr_Call{
-			Target:   call.Target,
-			Function: alias,
-			Args:     call.Args,
-		}
+	call = t.resolve(call)
+	if op, ok := comparisonSQL[call.Function]; ok {
+		return t.transpileComparison(call, op)
 	}
 	switch call.Function {
-	case operators.Equals, operators.NotEquals,
-		operators.Less, operators.LessEquals,
-		operators.Greater, operators.GreaterEquals:
-		return t.transpileComparison(call)
-
 	case operators.LogicalAnd:
 		return t.transpileBinary(call, "AND")
 
@@ -228,23 +398,22 @@ func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
 // transpileComparison handles =, !=, <, <=, >, >=. Each side may be an
 // identifier (resolved through the column map) or a literal (bound as a
 // placeholder). Column-to-column comparisons are supported.
-func (t *transpiler) transpileComparison(call *exprpb.Expr_Call) (string, error) {
-	op, ok := comparisonSQL[call.Function]
-	if !ok {
-		return "", fmt.Errorf("unsupported comparison %q", call.Function)
-	}
+func (t *transpiler) transpileComparison(call *exprpb.Expr_Call, op string) (string, error) {
 	if len(call.Args) != 2 {
 		return "", fmt.Errorf("%s expects 2 arguments, got %d", op, len(call.Args))
 	}
-	lhs, err := t.transpile(call.Args[0])
+	if err := t.checkSameType(call.Args[0], call.Args[1]); err != nil {
+		return "", err
+	}
+	lhs, rhs, err := t.operands(call.Args[0], call.Args[1])
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(call.Args[1])
-	if err != nil {
-		return "", err
+	lhs = t.castLiteral(lhs, call.Args[0], call.Args[1])
+	if t.isDyn(call.Args[0]) {
+		rhs = t.castLiteral(rhs, call.Args[1])
 	}
-	return fmt.Sprintf("%s %s %s", lhs, op, rhs), nil
+	return lhs + " " + op + " " + rhs, nil
 }
 
 func (t *transpiler) transpileBinary(call *exprpb.Expr_Call, op string) (string, error) {
@@ -270,7 +439,8 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 	if len(call.Args) != 2 {
 		return "", fmt.Errorf("in expects 2 arguments, got %d", len(call.Args))
 	}
-	lhs, err := t.transpile(call.Args[0])
+	mark := len(t.args)
+	lhs, err := t.operand(call.Args[0])
 	if err != nil {
 		return "", err
 	}
@@ -280,13 +450,26 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 	}
 	elems := list.ListExpr.GetElements()
 	if len(elems) == 0 {
+		// lhs is still validated above (fail closed on unknown fields),
+		// but any args it bound must be dropped: they are unreferenced.
+		t.args = t.args[:mark]
 		return "FALSE", nil
 	}
+	for _, e := range elems {
+		if err := t.checkSameType(call.Args[0], e); err != nil {
+			return "", err
+		}
+	}
+	lhs = t.castLiteral(lhs, call.Args[0], elems...)
+	dyn := t.isDyn(call.Args[0])
 	parts := make([]string, len(elems))
 	for i, e := range elems {
 		s, err := t.transpile(e)
 		if err != nil {
 			return "", err
+		}
+		if dyn {
+			s = t.castLiteral(s, e)
 		}
 		parts[i] = s
 	}
@@ -301,6 +484,11 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 //	startsWith: leading=false trailing=true   →  LIKE rhs || '%'
 //	endsWith:   leading=true  trailing=false  →  LIKE '%' || rhs
 //
+// A string-literal argument has its LIKE metacharacters (%, _, \)
+// escaped before binding so it matches literally, as in CEL. Any other
+// argument is escaped in SQL via replace(), using E'...' escape strings so the
+// backslashes parse the same regardless of standard_conforming_strings.
+//
 // Accepts both the method-style call (`s.contains(x)` → Target=s,
 // Args=[x]) and the function-style call (`contains(s, x)` → Target=nil,
 // Args=[s, x]) so callers that synthesize ASTs from non-cel-go parsers
@@ -310,13 +498,20 @@ func (t *transpiler) transpileLike(call *exprpb.Expr_Call, leadingPct, trailingP
 	if err != nil {
 		return "", err
 	}
-	lhs, err := t.transpile(lhsExpr)
+	lhs, err := t.operand(lhsExpr)
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(rhsExpr)
-	if err != nil {
-		return "", err
+	lhs = t.castLiteral(lhs, lhsExpr)
+	var rhs string
+	if s, ok := stringLiteral(rhsExpr); ok {
+		rhs = t.placeholder(likeEscaper.Replace(s))
+	} else {
+		rhs, err = t.operand(rhsExpr)
+		if err != nil {
+			return "", err
+		}
+		rhs = `replace(replace(replace(` + rhs + `, E'\\', E'\\\\'), '%', E'\\%'), '_', E'\\_')`
 	}
 	var sb strings.Builder
 	sb.WriteString(lhs)
@@ -337,14 +532,11 @@ func (t *transpiler) transpileMatches(call *exprpb.Expr_Call) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lhs, err := t.transpile(lhsExpr)
+	lhs, rhs, err := t.operands(lhsExpr, rhsExpr)
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(rhsExpr)
-	if err != nil {
-		return "", err
-	}
+	lhs = t.castLiteral(lhs, lhsExpr)
 	return lhs + " ~ " + rhs, nil
 }
 
@@ -386,8 +578,7 @@ func (t *transpiler) transpileTimeFunc(
 }
 
 // transpileUnaryMinus folds -<literal> into a single signed
-// placeholder. Anything else (e.g. -column) is rejected; CEL's type
-// checker normally blocks those before reaching us.
+// placeholder. Negating anything else (e.g. -column) is rejected.
 func (t *transpiler) transpileUnaryMinus(call *exprpb.Expr_Call) (string, error) {
 	if len(call.Args) != 1 {
 		return "", fmt.Errorf("unary minus expects 1 argument, got %d", len(call.Args))
@@ -398,6 +589,9 @@ func (t *transpiler) transpileUnaryMinus(call *exprpb.Expr_Call) (string, error)
 	}
 	switch v := c.ConstExpr.ConstantKind.(type) {
 	case *exprpb.Constant_Int64Value:
+		if v.Int64Value == math.MinInt64 {
+			return "", fmt.Errorf("unary minus overflows int64")
+		}
 		return t.placeholder(-v.Int64Value), nil
 	case *exprpb.Constant_DoubleValue:
 		return t.placeholder(-v.DoubleValue), nil
@@ -418,12 +612,33 @@ func stringLiteral(e *exprpb.Expr) (string, bool) {
 	return s.StringValue, true
 }
 
+// parseTimestamp parses an RFC 3339 timestamp and normalizes it to UTC.
+// pgx drops the zone when binding to a timestamp (without time zone)
+// column, so a non-UTC offset would otherwise select a different
+// instant than CEL does. Sub-microsecond precision, which Postgres
+// would silently truncate, is rejected.
 func parseTimestamp(s string) (any, error) {
-	return time.Parse(time.RFC3339, s)
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, err
+	}
+	if ts.Nanosecond()%int(time.Microsecond) != 0 {
+		return nil, fmt.Errorf("%q has sub-microsecond precision, which a Postgres timestamp cannot represent", s)
+	}
+	return ts.UTC(), nil
 }
 
+// parseDuration parses a duration, rejecting sub-microsecond precision
+// that a Postgres interval would silently truncate.
 func parseDuration(s string) (any, error) {
-	return time.ParseDuration(s)
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return nil, err
+	}
+	if d%time.Microsecond != 0 {
+		return nil, fmt.Errorf("%q has sub-microsecond precision, which a Postgres interval cannot represent", s)
+	}
+	return d, nil
 }
 
 // quoteIdent quotes each dot-separated segment of a column path as a

@@ -26,6 +26,9 @@
             devcontainer-env.packages.${system}.default
             pkgs.go
           ];
+          shellHook = ''
+            eval "$(devcontainer-env export)"
+          '';
         };
       }
     );

@@ -1,6 +1,7 @@
 package pgxcel
 
 import (
+	"math"
 	"time"
 
 	"cel.dev/cel-go/cel"
@@ -49,7 +50,7 @@ var _ = Describe("Where", func() {
 			cel.Variable("id", cel.IntType),
 			cel.Variable("other", cel.IntType))
 		_, _, err := Where(ast, WithColumns(map[string]string{"id": "id"}))
-		Expect(err).To(MatchError(ContainSubstring(`unknown field "other"`)))
+		Expect(err).To(MatchError(`pgxcel: unknown field "other"`))
 	})
 
 	It("combines AND with parentheses per branch", func() {
@@ -159,12 +160,214 @@ var _ = Describe("Where", func() {
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "name"`)))
 	})
 
+	It("rejects a param offset below 1", func() {
+		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"name": "name"}), WithParamOffset(0))
+		Expect(err).To(MatchError(ContainSubstring("param offset must be at least 1, got 0")))
+	})
+
+	It("parenthesizes a comparison used as a comparison operand", func() {
+		ast := mustCompile(`(a == 1) == (b == 2)`,
+			cel.Variable("a", cel.IntType),
+			cel.Variable("b", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a", "b": "b"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`("a" = $1) = ("b" = $2)`))
+		Expect(args).To(Equal([]any{int64(1), int64(2)}))
+	})
+
+	It("parenthesizes a comparison used as the lhs of `in`", func() {
+		ast := mustCompile(`(a < b) in [true]`,
+			cel.Variable("a", cel.IntType),
+			cel.Variable("b", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a", "b": "b"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`("a" < "b") IN ($1)`))
+		Expect(args).To(Equal([]any{true}))
+	})
+
+	It("escapes LIKE metacharacters in a string literal", func() {
+		ast := mustCompile(`name.contains("50%_\\")`, cel.Variable("name", cel.StringType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"name" LIKE '%' || $1 || '%'`))
+		Expect(args).To(Equal([]any{`50\%\_\\`}))
+	})
+
+	It("escapes LIKE metacharacters in SQL for a column argument", func() {
+		ast := mustCompile(`name.startsWith(prefix)`,
+			cel.Variable("name", cel.StringType),
+			cel.Variable("prefix", cel.StringType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name", "prefix": "prefix"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"name" LIKE replace(replace(replace("prefix", E'\\', E'\\\\'), '%', E'\\%'), '_', E'\\_') || '%'`))
+		Expect(args).To(BeEmpty())
+	})
+
+	It("rejects the has() macro", func() {
+		ast := mustCompile(`has(m.k)`, cel.Variable("m", cel.MapType(cel.StringType, cel.StringType)))
+		_, _, err := Where(ast, WithColumns(map[string]string{"m.k": "m_k"}))
+		Expect(err).To(MatchError(ContainSubstring("has() is not supported")))
+	})
+
+	It("drops args bound by the lhs of an empty `in`", func() {
+		ast := mustCompile(`timestamp("2025-01-02T03:04:05Z") in [] || a == 1`,
+			cel.Variable("a", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`(FALSE OR "a" = $1)`))
+		Expect(args).To(Equal([]any{int64(1)}))
+	})
+
+	It("rejects a non-bool expression", func() {
+		ast := mustCompile(`name`, cel.Variable("name", cel.StringType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
+		Expect(err).To(MatchError("pgxcel: expression must evaluate to bool, got string"))
+	})
+
+	It("rejects a mixed-type `in` list", func() {
+		ast := mustCompile(`age in [8.6, 1]`, cel.Variable("age", cel.IntType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"age": "age"}))
+		Expect(err).To(MatchError(ContainSubstring("cannot compare int with double")))
+	})
+
+	It("rejects a cross-type numeric comparison", func() {
+		env, err := cel.NewEnv(cel.Variable("age", cel.IntType), cel.CrossTypeNumericComparisons(true))
+		Expect(err).NotTo(HaveOccurred())
+		ast, iss := env.Compile(`age < 8.6`)
+		Expect(iss.Err()).NotTo(HaveOccurred())
+		_, _, err = Where(ast, WithColumns(map[string]string{"age": "age"}))
+		Expect(err).To(MatchError(ContainSubstring("cannot compare int with double")))
+	})
+
+	It("compares a nullable column with a literal of its primitive type", func() {
+		ast := mustCompile(`age == 1`, cel.Variable("age", cel.NullableType(cel.IntType)))
+		where, args, err := Where(ast, WithColumns(map[string]string{"age": "age"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"age" = $1`))
+		Expect(args).To(Equal([]any{int64(1)}))
+	})
+
+	It("normalizes timestamp literals to UTC", func() {
+		ast := mustCompile(`ts == timestamp("2025-01-02T03:04:05+02:00")`,
+			cel.Variable("ts", cel.TimestampType))
+		_, args, err := Where(ast, WithColumns(map[string]string{"ts": "ts"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal([]any{time.Date(2025, 1, 2, 1, 4, 5, 0, time.UTC)}))
+	})
+
+	It("rejects timestamps with sub-microsecond precision", func() {
+		ast := mustCompile(`ts >= timestamp("2025-01-02T01:04:05.0000005Z")`, cel.Variable("ts", cel.TimestampType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"ts": "ts"}))
+		Expect(err).To(MatchError(ContainSubstring("sub-microsecond precision")))
+	})
+
+	DescribeTable("casts literals compared with a dyn operand",
+		func(src string, typ *cel.Type, expected string) {
+			ast := mustCompile(src, cel.Variable("x", typ))
+			where, _, err := Where(ast, WithColumns(map[string]string{"x": "x"}))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(where).To(Equal(expected))
+		},
+		Entry("comparison", `x == 8.6`, cel.DynType, `"x" = $1::double precision`),
+		Entry("negated literal", `x < -1`, cel.DynType, `"x" < $1::bigint`),
+		Entry("in list", `x in [1, "8"]`, cel.DynType, `"x" IN ($1::bigint, $2::text)`),
+		Entry("literal lhs", `8.6 == x`, cel.DynType, `$1::double precision = "x"`),
+		Entry("google.protobuf.Any", `x == 1`, cel.AnyType, `"x" = $1::bigint`),
+	)
+
+	It("rejects durations with sub-microsecond precision", func() {
+		ast := mustCompile(`d == duration("1ns")`, cel.Variable("d", cel.DurationType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"d": "d"}))
+		Expect(err).To(MatchError(ContainSubstring("sub-microsecond precision")))
+	})
+
+	It("casts the lhs of a comparison between two literals", func() {
+		ast := mustCompile(`2 < 10`)
+		where, args, err := Where(ast)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`$1::bigint < $2`))
+		Expect(args).To(Equal([]any{int64(2), int64(10)}))
+	})
+
+	It("casts the lhs of `in` when every operand is a literal", func() {
+		ast := mustCompile(`-1 in [1, 2]`)
+		where, args, err := Where(ast)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`$1::bigint IN ($2, $3)`))
+		Expect(args).To(Equal([]any{int64(-1), int64(1), int64(2)}))
+	})
+
+	It("does not cast a literal compared with a column", func() {
+		ast := mustCompile(`timestamp("2025-01-02T03:04:05Z") < ts`, cel.Variable("ts", cel.TimestampType))
+		where, _, err := Where(ast, WithColumns(map[string]string{"ts": "ts"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`$1 < "ts"`))
+	})
+
+	DescribeTable("renders string functions end to end",
+		func(src, expected string, arg any) {
+			ast := mustCompile(src, cel.Variable("name", cel.StringType))
+			where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(where).To(Equal(expected))
+			Expect(args).To(Equal([]any{arg}))
+		},
+		Entry("startsWith", `name.startsWith("a_")`, `"name" LIKE $1 || '%'`, `a\_`),
+		Entry("endsWith", `name.endsWith("%z")`, `"name" LIKE '%' || $1`, `\%z`),
+		Entry("matches", `name.matches("^a.*")`, `"name" ~ $1`, "^a.*"),
+		Entry("literal receiver", `"abc".contains(name)`,
+			`$1::text LIKE '%' || replace(replace(replace("name", E'\\', E'\\\\'), '%', E'\\%'), '_', E'\\_') || '%'`, "abc"),
+	)
+
+	DescribeTable("binds numeric literals end to end",
+		func(src string, typ *cel.Type, arg any) {
+			ast := mustCompile(src, cel.Variable("n", typ))
+			where, args, err := Where(ast, WithColumns(map[string]string{"n": "n"}))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(where).To(Equal(`"n" < $1`))
+			Expect(args).To(Equal([]any{arg}))
+		},
+		Entry("uint", `n < 5u`, cel.UintType, uint64(5)),
+		Entry("double", `n < 2.5`, cel.DoubleType, 2.5),
+	)
+
+	It("resolves a dotted map path end to end", func() {
+		ast := mustCompile(`address.city == "Sofia"`,
+			cel.Variable("address", cel.MapType(cel.StringType, cel.StringType)))
+		where, args, err := Where(ast, WithColumns(map[string]string{"address.city": "addresses.city"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"addresses"."city" = $1`))
+		Expect(args).To(Equal([]any{"Sofia"}))
+	})
+
+	It("applies WithFunctions aliases, including operand parenthesization", func() {
+		ident := func(id int64, name string) *exprpb.Expr {
+			return &exprpb.Expr{Id: id, ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: name}}}
+		}
+		eq := func(id int64, lhs, rhs *exprpb.Expr) *exprpb.Expr {
+			return &exprpb.Expr{Id: id, ExprKind: &exprpb.Expr_CallExpr{CallExpr: &exprpb.Expr_Call{
+				Function: "=", Args: []*exprpb.Expr{lhs, rhs},
+			}}}
+		}
+		boolType := &exprpb.Type{TypeKind: &exprpb.Type_Primitive{Primitive: exprpb.Type_BOOL}}
+		ast := cel.CheckedExprToAst(&exprpb.CheckedExpr{
+			Expr:    eq(1, eq(2, ident(3, "a"), ident(4, "b")), ident(5, "c")),
+			TypeMap: map[int64]*exprpb.Type{1: boolType},
+		})
+		where, args, err := Where(ast,
+			WithColumns(map[string]string{"a": "a", "b": "b", "c": "c"}),
+			WithFunctions(map[string]string{"=": operators.Equals}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`("a" = "b") = "c"`))
+		Expect(args).To(BeEmpty())
+	})
 })
 
 var _ = Describe("transpiler internals", func() {
 	Describe("transpile", func() {
 		It("errors on an unsupported expression kind", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpile(&exprpb.Expr{
 				ExprKind: &exprpb.Expr_ListExpr{ListExpr: &exprpb.Expr_CreateList{}},
 			})
@@ -172,7 +375,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("errors when a Select operand is not an identifier chain", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpile(&exprpb.Expr{
 				ExprKind: &exprpb.Expr_SelectExpr{
 					SelectExpr: &exprpb.Expr_Select{
@@ -187,10 +390,10 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("resolves a dotted Select path through the column map", func() {
-			t := &transpiler{
+			t := &transpiler{config: config{
 				columns:     map[string]string{"address.city": "addr.city"},
 				paramOffset: 1,
-			}
+			}}
 			out, err := t.transpile(&exprpb.Expr{
 				ExprKind: &exprpb.Expr_SelectExpr{
 					SelectExpr: &exprpb.Expr_Select{
@@ -208,7 +411,7 @@ var _ = Describe("transpiler internals", func() {
 
 	Describe("transpileConst", func() {
 		It("binds a uint64 value", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			out, err := t.transpileConst(&exprpb.Constant{
 				ConstantKind: &exprpb.Constant_Uint64Value{Uint64Value: 42},
 			})
@@ -218,7 +421,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("binds a double value", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			out, err := t.transpileConst(&exprpb.Constant{
 				ConstantKind: &exprpb.Constant_DoubleValue{DoubleValue: 3.14},
 			})
@@ -228,7 +431,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("binds a bool value", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			out, err := t.transpileConst(&exprpb.Constant{
 				ConstantKind: &exprpb.Constant_BoolValue{BoolValue: true},
 			})
@@ -238,7 +441,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("respects paramOffset for the first placeholder", func() {
-			t := &transpiler{paramOffset: 5}
+			t := &transpiler{config: config{paramOffset: 5}}
 			out, err := t.transpileConst(&exprpb.Constant{
 				ConstantKind: &exprpb.Constant_Int64Value{Int64Value: 1},
 			})
@@ -247,7 +450,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("errors on an unsupported constant kind", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileConst(&exprpb.Constant{
 				ConstantKind: &exprpb.Constant_NullValue{},
 			})
@@ -257,13 +460,13 @@ var _ = Describe("transpiler internals", func() {
 
 	Describe("transpileCall", func() {
 		It("errors on an unsupported function", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: "unknown"})
 			Expect(err).To(MatchError(ContainSubstring("unsupported function")))
 		})
 
 		It("rejects unary minus on a non-literal operand", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"age": "age"}}
+			t := &transpiler{config: config{paramOffset: 1, columns: map[string]string{"age": "age"}}}
 			ident := &exprpb.Expr{
 				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "age"}},
 			}
@@ -272,13 +475,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects unary minus with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: "-_"})
 			Expect(err).To(MatchError(ContainSubstring("unary minus expects 1 argument")))
 		})
 
 		It("rejects unary minus on a non-numeric literal", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "-_",
 				Args: []*exprpb.Expr{{
@@ -293,7 +496,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("folds unary minus on an int64 literal", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			out, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "-_",
 				Args: []*exprpb.Expr{{
@@ -309,8 +512,23 @@ var _ = Describe("transpiler internals", func() {
 			Expect(t.args).To(Equal([]any{int64(-7)}))
 		})
 
+		It("rejects unary minus that overflows int64", func() {
+			t := &transpiler{config: config{paramOffset: 1}}
+			_, err := t.transpileCall(&exprpb.Expr_Call{
+				Function: "-_",
+				Args: []*exprpb.Expr{{
+					ExprKind: &exprpb.Expr_ConstExpr{
+						ConstExpr: &exprpb.Constant{
+							ConstantKind: &exprpb.Constant_Int64Value{Int64Value: math.MinInt64},
+						},
+					},
+				}},
+			})
+			Expect(err).To(MatchError("unary minus overflows int64"))
+		})
+
 		It("folds unary minus on a double literal", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			out, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "-_",
 				Args: []*exprpb.Expr{{
@@ -327,13 +545,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects NOT with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: "!_"})
 			Expect(err).To(MatchError(ContainSubstring("NOT expects 1 argument")))
 		})
 
 		It("propagates errors from inside NOT", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			bad := &exprpb.Expr{
 				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
 			}
@@ -342,13 +560,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects timestamp() with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: "timestamp"})
 			Expect(err).To(MatchError(ContainSubstring("timestamp expects 1 argument")))
 		})
 
 		It("rejects timestamp() argument that is not a constant expression", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "timestamp",
 				Args: []*exprpb.Expr{{
@@ -359,7 +577,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects timestamp() without a string literal argument", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "timestamp",
 				Args: []*exprpb.Expr{{
@@ -374,7 +592,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects timestamp() with an unparseable string", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: "timestamp",
 				Args: []*exprpb.Expr{{
@@ -390,10 +608,10 @@ var _ = Describe("transpiler internals", func() {
 
 		DescribeTable("renders CEL string membership functions as LIKE",
 			func(fn, expected string) {
-				t := &transpiler{
+				t := &transpiler{config: config{
 					paramOffset: 1,
 					columns:     map[string]string{"name": "name"},
-				}
+				}}
 				out, err := t.transpileCall(&exprpb.Expr_Call{
 					Function: fn,
 					Target:   &exprpb.Expr{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
@@ -416,10 +634,10 @@ var _ = Describe("transpiler internals", func() {
 		)
 
 		It("accepts the function-style call shape (no Target, two Args)", func() {
-			t := &transpiler{
+			t := &transpiler{config: config{
 				paramOffset: 1,
 				columns:     map[string]string{"name": "name"},
-			}
+			}}
 			out, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: overloads.Contains,
 				Args: []*exprpb.Expr{
@@ -436,13 +654,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects a string method call with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: overloads.Contains})
 			Expect(err).To(MatchError(ContainSubstring("contains expects 2 arguments")))
 		})
 
 		It("propagates receiver errors from a string method call", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			bad := &exprpb.Expr{
 				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
 			}
@@ -459,7 +677,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("propagates argument errors from a string method call", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			t := &transpiler{config: config{paramOffset: 1, columns: map[string]string{"name": "name"}}}
 			lhs := &exprpb.Expr{
 				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}},
 			}
@@ -473,8 +691,8 @@ var _ = Describe("transpiler internals", func() {
 			Expect(err).To(MatchError(ContainSubstring(`unknown field "missing"`)))
 		})
 
-		It("rejects a string method call with too many args in method form", func() {
-			t := &transpiler{paramOffset: 1}
+		It("rejects a string method call with the wrong arity in method form", func() {
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: overloads.Contains,
 				Target:   &exprpb.Expr{ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "name"}}},
@@ -483,7 +701,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("propagates receiver errors from matches", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			bad := &exprpb.Expr{
 				ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
 			}
@@ -500,13 +718,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects matches with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: overloads.Matches})
 			Expect(err).To(MatchError(ContainSubstring("matches expects 2 arguments")))
 		})
 
 		It("renders `in` with an empty list literal as FALSE", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			t := &transpiler{config: config{paramOffset: 1, columns: map[string]string{"name": "name"}}}
 			out, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: operators.In,
 				Args: []*exprpb.Expr{
@@ -519,13 +737,13 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("rejects `in` with the wrong arity", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{Function: operators.In})
 			Expect(err).To(MatchError(ContainSubstring("in expects 2 arguments")))
 		})
 
 		It("rejects `in` when rhs is not a list literal", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			t := &transpiler{config: config{paramOffset: 1, columns: map[string]string{"name": "name"}}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: operators.In,
 				Args: []*exprpb.Expr{
@@ -539,7 +757,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("propagates lhs errors from `in`", func() {
-			t := &transpiler{paramOffset: 1}
+			t := &transpiler{config: config{paramOffset: 1}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: operators.In,
 				Args: []*exprpb.Expr{
@@ -551,7 +769,7 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("propagates element errors from `in`", func() {
-			t := &transpiler{paramOffset: 1, columns: map[string]string{"name": "name"}}
+			t := &transpiler{config: config{paramOffset: 1, columns: map[string]string{"name": "name"}}}
 			_, err := t.transpileCall(&exprpb.Expr_Call{
 				Function: operators.In,
 				Args: []*exprpb.Expr{
@@ -567,11 +785,11 @@ var _ = Describe("transpiler internals", func() {
 		})
 
 		It("aliases unknown function names via WithFunctions", func() {
-			t := &transpiler{
+			t := &transpiler{config: config{
 				paramOffset: 1,
 				columns:     map[string]string{"name": "name", "age": "age"},
 				functions:   map[string]string{"FUZZY": operators.LogicalAnd},
-			}
+			}}
 			lhs := &exprpb.Expr{ExprKind: &exprpb.Expr_CallExpr{CallExpr: &exprpb.Expr_Call{
 				Function: "_==_",
 				Args: []*exprpb.Expr{
@@ -606,28 +824,22 @@ var _ = Describe("transpiler internals", func() {
 })
 
 var _ = Describe("transpileComparison", func() {
-	It("rejects an unmapped operator", func() {
-		t := &transpiler{paramOffset: 1}
-		_, err := t.transpileComparison(&exprpb.Expr_Call{Function: "_~_"})
-		Expect(err).To(MatchError(ContainSubstring(`unsupported comparison "_~_"`)))
-	})
-
 	It("rejects the wrong number of arguments", func() {
-		t := &transpiler{paramOffset: 1}
-		_, err := t.transpileComparison(&exprpb.Expr_Call{Function: "_==_"})
+		t := &transpiler{config: config{paramOffset: 1}}
+		_, err := t.transpileCall(&exprpb.Expr_Call{Function: operators.Equals})
 		Expect(err).To(MatchError(ContainSubstring("= expects 2 arguments")))
 	})
 })
 
 var _ = Describe("transpileBinary", func() {
 	It("rejects the wrong number of arguments", func() {
-		t := &transpiler{paramOffset: 1}
+		t := &transpiler{config: config{paramOffset: 1}}
 		_, err := t.transpileBinary(&exprpb.Expr_Call{Function: "_&&_"}, "AND")
 		Expect(err).To(MatchError(ContainSubstring("AND expects 2 arguments")))
 	})
 
 	It("propagates lhs errors", func() {
-		t := &transpiler{paramOffset: 1}
+		t := &transpiler{config: config{paramOffset: 1}}
 		bad := &exprpb.Expr{
 			ExprKind: &exprpb.Expr_IdentExpr{IdentExpr: &exprpb.Expr_Ident{Name: "missing"}},
 		}
@@ -641,7 +853,7 @@ var _ = Describe("transpileBinary", func() {
 	})
 
 	It("propagates rhs errors", func() {
-		t := &transpiler{paramOffset: 1}
+		t := &transpiler{config: config{paramOffset: 1}}
 		ok := &exprpb.Expr{
 			ExprKind: &exprpb.Expr_ConstExpr{ConstExpr: &exprpb.Constant{
 				ConstantKind: &exprpb.Constant_BoolValue{BoolValue: true},
