@@ -25,7 +25,7 @@ var comparisonSQL = map[string]string{
 	operators.GreaterEquals: ">=",
 }
 
-// Option configures a Transpile call.
+// Option configures a Where call.
 type Option func(*config)
 
 type config struct {
@@ -48,7 +48,7 @@ func WithColumns(columns map[string]string) Option {
 // "AND" / "NOT" instead of operators.Equals / LogicalAnd / LogicalNot.
 //
 // Each map entry is alias → canonical, where canonical is one of the
-// names recognized by Transpile (typically a value from the cel-go
+// names recognized by Where (typically a value from the cel-go
 // operators package). Unknown aliases are passed through unchanged.
 func WithFunctions(functions map[string]string) Option {
 	return func(c *config) { c.functions = functions }
@@ -62,8 +62,10 @@ func WithParamOffset(n int) Option {
 	return func(c *config) { c.paramOffset = n }
 }
 
-// Transpile turns ast into a Postgres WHERE fragment (no enclosing
-// parentheses) plus the bound positional args.
+// Where turns ast into a Postgres WHERE fragment (no enclosing
+// parentheses) plus the bound positional args. The fragment does not
+// include the WHERE keyword, so it can also be spliced into any other
+// boolean context such as HAVING or JOIN ... ON.
 //
 // ast must be checked (ast.IsChecked() == true). An unchecked AST
 // returns an error. A nil ast returns ("", nil, nil) — the caller
@@ -71,7 +73,7 @@ func WithParamOffset(n int) Option {
 //
 // Configure resolution and placeholder numbering via WithColumns and
 // WithParamOffset.
-func Transpile(ast *cel.Ast, opts ...Option) (string, []any, error) {
+func Where(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	if ast == nil {
 		return "", nil, nil
 	}

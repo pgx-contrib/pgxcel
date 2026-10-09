@@ -38,7 +38,7 @@ columns := map[string]string{
     "name": "users.name",
     "age":  "users.age",
 }
-where, args, err := pgxcel.Transpile(ast, pgxcel.WithColumns(columns))
+where, args, err := pgxcel.Where(ast, pgxcel.WithColumns(columns))
 // where: ("users"."name" = $1 AND "users"."age" > $2)
 // args:  []any{"Alice", int64(30)}
 ```
@@ -47,7 +47,7 @@ where, args, err := pgxcel.Transpile(ast, pgxcel.WithColumns(columns))
 
 - `pgxcel.WithColumns(map[string]string)` — the path → DB-column
   allow-list. Lookup is **fail-closed**: any identifier the AST
-  references that is not in the map causes `Transpile` to return an
+  references that is not in the map causes `Where` to return an
   error. When omitted, every ident in the AST errors. **Never feed
   user input as a column name**; the value of each map entry is
   emitted into the SQL after only identifier quoting.

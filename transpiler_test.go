@@ -11,10 +11,10 @@ import (
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
-var _ = Describe("Transpile", func() {
+var _ = Describe("Where", func() {
 	It("emits an equality predicate with a bound arg", func() {
 		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"name" = $1`))
 		Expect(args).To(Equal([]any{"Alice"}))
@@ -22,14 +22,14 @@ var _ = Describe("Transpile", func() {
 
 	It("maps AIP paths to their backing DB columns", func() {
 		ast := mustCompile(`title == "The Go Programming Language"`, cel.Variable("title", cel.StringType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"title": "book_title"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"title": "book_title"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"book_title" = $1`))
 		Expect(args).To(Equal([]any{"The Go Programming Language"}))
 	})
 
 	It("returns empty when ast is nil", func() {
-		where, args, err := Transpile(nil)
+		where, args, err := Where(nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(BeEmpty())
 		Expect(args).To(BeEmpty())
@@ -40,7 +40,7 @@ var _ = Describe("Transpile", func() {
 		Expect(err).NotTo(HaveOccurred())
 		ast, iss := env.Parse(`1 == 1`)
 		Expect(iss.Err()).NotTo(HaveOccurred())
-		_, _, err = Transpile(ast)
+		_, _, err = Where(ast)
 		Expect(err).To(MatchError(ContainSubstring("unchecked ast")))
 	})
 
@@ -48,7 +48,7 @@ var _ = Describe("Transpile", func() {
 		ast := mustCompile(`id == other`,
 			cel.Variable("id", cel.IntType),
 			cel.Variable("other", cel.IntType))
-		_, _, err := Transpile(ast, WithColumns(map[string]string{"id": "id"}))
+		_, _, err := Where(ast, WithColumns(map[string]string{"id": "id"}))
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "other"`)))
 	})
 
@@ -56,7 +56,7 @@ var _ = Describe("Transpile", func() {
 		ast := mustCompile(`name == "Alice" && age > 30`,
 			cel.Variable("name", cel.StringType),
 			cel.Variable("age", cel.IntType))
-		where, args, err := Transpile(ast,
+		where, args, err := Where(ast,
 			WithColumns(map[string]string{"name": "name", "age": "age"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`("name" = $1 AND "age" > $2)`))
@@ -65,7 +65,7 @@ var _ = Describe("Transpile", func() {
 
 	It("combines OR with parentheses per branch", func() {
 		ast := mustCompile(`name == "Alice" || name == "Bob"`, cel.Variable("name", cel.StringType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`("name" = $1 OR "name" = $2)`))
 		Expect(args).To(Equal([]any{"Alice", "Bob"}))
@@ -73,7 +73,7 @@ var _ = Describe("Transpile", func() {
 
 	It("wraps NOT in parentheses", func() {
 		ast := mustCompile(`!(name == "Alice")`, cel.Variable("name", cel.StringType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`(NOT "name" = $1)`))
 		Expect(args).To(Equal([]any{"Alice"}))
@@ -82,7 +82,7 @@ var _ = Describe("Transpile", func() {
 	It("binds timestamp literals as time.Time", func() {
 		ast := mustCompile(`create_time > timestamp("2025-01-02T03:04:05Z")`,
 			cel.Variable("create_time", cel.TimestampType))
-		where, args, err := Transpile(ast,
+		where, args, err := Where(ast,
 			WithColumns(map[string]string{"create_time": "created_at"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"created_at" > $1`))
@@ -94,7 +94,7 @@ var _ = Describe("Transpile", func() {
 	It("binds duration literals as time.Duration", func() {
 		ast := mustCompile(`timeout > duration("1h30m")`,
 			cel.Variable("timeout", cel.DurationType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"timeout": "timeout"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"timeout": "timeout"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"timeout" > $1`))
 		Expect(args).To(Equal([]any{90 * time.Minute}))
@@ -102,7 +102,7 @@ var _ = Describe("Transpile", func() {
 
 	It("folds unary minus on numeric literals", func() {
 		ast := mustCompile(`balance > -5`, cel.Variable("balance", cel.IntType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"balance": "balance"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"balance": "balance"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"balance" > $1`))
 		Expect(args).To(Equal([]any{int64(-5)}))
@@ -111,7 +111,7 @@ var _ = Describe("Transpile", func() {
 	It("renders `in` over a list literal as SQL IN", func() {
 		ast := mustCompile(`name in ["Alice", "Bob", "Carol"]`,
 			cel.Variable("name", cel.StringType))
-		where, args, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"name" IN ($1, $2, $3)`))
 		Expect(args).To(Equal([]any{"Alice", "Bob", "Carol"}))
@@ -121,7 +121,7 @@ var _ = Describe("Transpile", func() {
 		ast := mustCompile(`updated > created`,
 			cel.Variable("updated", cel.TimestampType),
 			cel.Variable("created", cel.TimestampType))
-		where, args, err := Transpile(ast,
+		where, args, err := Where(ast,
 			WithColumns(map[string]string{"updated": "updated_at", "created": "created_at"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"updated_at" > "created_at"`))
@@ -130,7 +130,7 @@ var _ = Describe("Transpile", func() {
 
 	It("starts placeholders at 1 by default", func() {
 		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
-		where, _, err := Transpile(ast, WithColumns(map[string]string{"name": "name"}))
+		where, _, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(where).To(Equal(`"name" = $1`))
 	})
@@ -139,7 +139,7 @@ var _ = Describe("Transpile", func() {
 		ast := mustCompile(`name == "Alice" && age > 30`,
 			cel.Variable("name", cel.StringType),
 			cel.Variable("age", cel.IntType))
-		where, args, err := Transpile(ast,
+		where, args, err := Where(ast,
 			WithColumns(map[string]string{"name": "name", "age": "age"}),
 			WithParamOffset(5))
 		Expect(err).NotTo(HaveOccurred())
@@ -149,13 +149,13 @@ var _ = Describe("Transpile", func() {
 
 	It("fails closed when a filter field is not in columns", func() {
 		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
-		_, _, err := Transpile(ast, WithColumns(map[string]string{"other": "other"}))
+		_, _, err := Where(ast, WithColumns(map[string]string{"other": "other"}))
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "name"`)))
 	})
 
 	It("fails closed when WithColumns is omitted", func() {
 		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
-		_, _, err := Transpile(ast)
+		_, _, err := Where(ast)
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "name"`)))
 	})
 
