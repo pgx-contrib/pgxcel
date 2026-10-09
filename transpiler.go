@@ -25,6 +25,28 @@ var comparisonSQL = map[string]string{
 	operators.GreaterEquals: ">=",
 }
 
+// infixPredicates lists the canonical functions rendered as bare infix
+// SQL (no enclosing parentheses). SQL precedence differs from CEL's (IN
+// and LIKE bind tighter than =, and = is non-associative), so these are
+// parenthesized whenever they appear as an operand of another operator.
+var infixPredicates = map[string]bool{
+	operators.Equals:        true,
+	operators.NotEquals:     true,
+	operators.Less:          true,
+	operators.LessEquals:    true,
+	operators.Greater:       true,
+	operators.GreaterEquals: true,
+	operators.In:            true,
+	overloads.Contains:      true,
+	overloads.StartsWith:    true,
+	overloads.EndsWith:      true,
+	overloads.Matches:       true,
+}
+
+// likeEscaper escapes the LIKE metacharacters in a literal pattern
+// using the default backslash escape character.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 // Option configures a Where call.
 type Option func(*config)
 
@@ -57,7 +79,7 @@ func WithFunctions(functions map[string]string) Option {
 // WithParamOffset sets the number of the first emitted placeholder.
 // Placeholders are then numbered offset, offset+1, ... so callers can
 // splice the fragment into a query that already has earlier bound
-// values. Defaults to 1.
+// values. Defaults to 1; values below 1 make Where return an error.
 func WithParamOffset(n int) Option {
 	return func(c *config) { c.paramOffset = n }
 }
@@ -84,6 +106,9 @@ func Where(ast *cel.Ast, opts ...Option) (string, []any, error) {
 	cfg := config{paramOffset: 1}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if cfg.paramOffset < 1 {
+		return "", nil, fmt.Errorf("pgxcel: param offset must be at least 1, got %d", cfg.paramOffset)
 	}
 	t := &transpiler{
 		columns:     cfg.columns,
@@ -113,7 +138,12 @@ func (t *transpiler) transpile(e *exprpb.Expr) (string, error) {
 	switch v := e.ExprKind.(type) {
 	case *exprpb.Expr_ConstExpr:
 		return t.transpileConst(v.ConstExpr)
-	case *exprpb.Expr_IdentExpr, *exprpb.Expr_SelectExpr:
+	case *exprpb.Expr_SelectExpr:
+		if v.SelectExpr.TestOnly {
+			return "", fmt.Errorf("has() is not supported")
+		}
+		return t.transpileIdent(e)
+	case *exprpb.Expr_IdentExpr:
 		return t.transpileIdent(e)
 	case *exprpb.Expr_CallExpr:
 		return t.transpileCall(v.CallExpr)
@@ -169,14 +199,35 @@ func (t *transpiler) transpileConst(c *exprpb.Constant) (string, error) {
 	}
 }
 
-func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
-	if alias, ok := t.functions[call.Function]; ok {
-		call = &exprpb.Expr_Call{
-			Target:   call.Target,
-			Function: alias,
-			Args:     call.Args,
-		}
+// operand transpiles e for use as an operand of an infix operator,
+// parenthesizing it when it is itself a bare infix predicate.
+func (t *transpiler) operand(e *exprpb.Expr) (string, error) {
+	s, err := t.transpile(e)
+	if err != nil {
+		return "", err
 	}
+	if c, ok := e.ExprKind.(*exprpb.Expr_CallExpr); ok && infixPredicates[t.resolve(c.CallExpr).Function] {
+		return "(" + s + ")", nil
+	}
+	return s, nil
+}
+
+// resolve returns call with its function name normalized through the
+// WithFunctions aliases.
+func (t *transpiler) resolve(call *exprpb.Expr_Call) *exprpb.Expr_Call {
+	alias, ok := t.functions[call.Function]
+	if !ok {
+		return call
+	}
+	return &exprpb.Expr_Call{
+		Target:   call.Target,
+		Function: alias,
+		Args:     call.Args,
+	}
+}
+
+func (t *transpiler) transpileCall(call *exprpb.Expr_Call) (string, error) {
+	call = t.resolve(call)
 	switch call.Function {
 	case operators.Equals, operators.NotEquals,
 		operators.Less, operators.LessEquals,
@@ -236,11 +287,11 @@ func (t *transpiler) transpileComparison(call *exprpb.Expr_Call) (string, error)
 	if len(call.Args) != 2 {
 		return "", fmt.Errorf("%s expects 2 arguments, got %d", op, len(call.Args))
 	}
-	lhs, err := t.transpile(call.Args[0])
+	lhs, err := t.operand(call.Args[0])
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(call.Args[1])
+	rhs, err := t.operand(call.Args[1])
 	if err != nil {
 		return "", err
 	}
@@ -270,7 +321,8 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 	if len(call.Args) != 2 {
 		return "", fmt.Errorf("in expects 2 arguments, got %d", len(call.Args))
 	}
-	lhs, err := t.transpile(call.Args[0])
+	mark := len(t.args)
+	lhs, err := t.operand(call.Args[0])
 	if err != nil {
 		return "", err
 	}
@@ -280,6 +332,9 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 	}
 	elems := list.ListExpr.GetElements()
 	if len(elems) == 0 {
+		// lhs is still validated above (fail closed on unknown fields),
+		// but any args it bound must be dropped: they are unreferenced.
+		t.args = t.args[:mark]
 		return "FALSE", nil
 	}
 	parts := make([]string, len(elems))
@@ -301,6 +356,10 @@ func (t *transpiler) transpileIn(call *exprpb.Expr_Call) (string, error) {
 //	startsWith: leading=false trailing=true   →  LIKE rhs || '%'
 //	endsWith:   leading=true  trailing=false  →  LIKE '%' || rhs
 //
+// A string-literal argument has its LIKE metacharacters (%, _, \)
+// escaped before binding so it matches literally, as in CEL. Any other
+// argument is escaped in SQL via replace().
+//
 // Accepts both the method-style call (`s.contains(x)` → Target=s,
 // Args=[x]) and the function-style call (`contains(s, x)` → Target=nil,
 // Args=[s, x]) so callers that synthesize ASTs from non-cel-go parsers
@@ -310,13 +369,19 @@ func (t *transpiler) transpileLike(call *exprpb.Expr_Call, leadingPct, trailingP
 	if err != nil {
 		return "", err
 	}
-	lhs, err := t.transpile(lhsExpr)
+	lhs, err := t.operand(lhsExpr)
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(rhsExpr)
-	if err != nil {
-		return "", err
+	var rhs string
+	if s, ok := stringLiteral(rhsExpr); ok {
+		rhs = t.placeholder(likeEscaper.Replace(s))
+	} else {
+		rhs, err = t.operand(rhsExpr)
+		if err != nil {
+			return "", err
+		}
+		rhs = `replace(replace(replace(` + rhs + `, '\', '\\'), '%', '\%'), '_', '\_')`
 	}
 	var sb strings.Builder
 	sb.WriteString(lhs)
@@ -337,11 +402,11 @@ func (t *transpiler) transpileMatches(call *exprpb.Expr_Call) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lhs, err := t.transpile(lhsExpr)
+	lhs, err := t.operand(lhsExpr)
 	if err != nil {
 		return "", err
 	}
-	rhs, err := t.transpile(rhsExpr)
+	rhs, err := t.operand(rhsExpr)
 	if err != nil {
 		return "", err
 	}

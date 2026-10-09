@@ -159,6 +159,64 @@ var _ = Describe("Where", func() {
 		Expect(err).To(MatchError(ContainSubstring(`unknown field "name"`)))
 	})
 
+	It("rejects a param offset below 1", func() {
+		ast := mustCompile(`name == "Alice"`, cel.Variable("name", cel.StringType))
+		_, _, err := Where(ast, WithColumns(map[string]string{"name": "name"}), WithParamOffset(0))
+		Expect(err).To(MatchError(ContainSubstring("param offset must be at least 1, got 0")))
+	})
+
+	It("parenthesizes a comparison used as a comparison operand", func() {
+		ast := mustCompile(`(a == 1) == (b == 2)`,
+			cel.Variable("a", cel.IntType),
+			cel.Variable("b", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a", "b": "b"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`("a" = $1) = ("b" = $2)`))
+		Expect(args).To(Equal([]any{int64(1), int64(2)}))
+	})
+
+	It("parenthesizes a comparison used as the lhs of `in`", func() {
+		ast := mustCompile(`(a < b) in [true]`,
+			cel.Variable("a", cel.IntType),
+			cel.Variable("b", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a", "b": "b"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`("a" < "b") IN ($1)`))
+		Expect(args).To(Equal([]any{true}))
+	})
+
+	It("escapes LIKE metacharacters in a string literal", func() {
+		ast := mustCompile(`name.contains("50%_\\")`, cel.Variable("name", cel.StringType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"name" LIKE '%' || $1 || '%'`))
+		Expect(args).To(Equal([]any{`50\%\_\\`}))
+	})
+
+	It("escapes LIKE metacharacters in SQL for a column argument", func() {
+		ast := mustCompile(`name.startsWith(prefix)`,
+			cel.Variable("name", cel.StringType),
+			cel.Variable("prefix", cel.StringType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"name": "name", "prefix": "prefix"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`"name" LIKE replace(replace(replace("prefix", '\', '\\'), '%', '\%'), '_', '\_') || '%'`))
+		Expect(args).To(BeEmpty())
+	})
+
+	It("rejects the has() macro", func() {
+		ast := mustCompile(`has(m.k)`, cel.Variable("m", cel.MapType(cel.StringType, cel.StringType)))
+		_, _, err := Where(ast, WithColumns(map[string]string{"m.k": "m_k"}))
+		Expect(err).To(MatchError(ContainSubstring("has() is not supported")))
+	})
+
+	It("drops args bound by the lhs of an empty `in`", func() {
+		ast := mustCompile(`timestamp("2025-01-02T03:04:05Z") in [] || a == 1`,
+			cel.Variable("a", cel.IntType))
+		where, args, err := Where(ast, WithColumns(map[string]string{"a": "a"}))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(where).To(Equal(`(FALSE OR "a" = $1)`))
+		Expect(args).To(Equal([]any{int64(1)}))
+	})
 })
 
 var _ = Describe("transpiler internals", func() {
