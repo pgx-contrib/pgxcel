@@ -4,6 +4,9 @@
   "service": "workspace",
   "dockerComposeFile": "docker-compose.yml",
   "workspaceFolder": "/home/vscode/workspace",
+  "containerEnv": {
+    "PGX_DATABASE_URL": "postgres://vscode@postgres:5432/pgxcel?sslmode=disable"
+  },
   "mounts": [
     "source=${localWorkspaceFolderBasename}-nix,target=/nix,type=volume",
     "source=${localWorkspaceFolderBasename}-cache,target=/home/vscode/.cache,type=volume"

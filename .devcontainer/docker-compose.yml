@@ -4,3 +4,18 @@ services:
     volumes:
       - ..:/home/vscode/workspace:cached
     command: sleep infinity
+
+  postgres:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vscode
+      POSTGRES_DB: pgxcel
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+    ports:
+      - 5432

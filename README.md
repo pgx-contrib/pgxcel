@@ -124,6 +124,18 @@ go test ./...
 go vet ./...
 ```
 
+The Postgres integration tests run each filter through `Where` against
+a real database and check that it selects the same rows cel-go
+evaluates as true. They are skipped unless `PGX_DATABASE_URL` is set.
+The devcontainer provides Postgres and sets it; from the host, start
+the devcontainer and run the tests inside `nix develop`, which exports
+`PGX_DATABASE_URL` rewritten to the mapped host port:
+
+```bash
+devcontainer up --workspace-folder .
+nix develop --command go test ./...
+```
+
 ## License
 
 [MIT](LICENSE)
