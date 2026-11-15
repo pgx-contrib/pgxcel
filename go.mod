@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	cel.dev/cel-go v0.33.2
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/onsi/ginkgo/v2 v2.34.0
 	github.com/onsi/gomega v1.44.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260420184626-e10c466a9529
